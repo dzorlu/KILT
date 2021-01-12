@@ -15,7 +15,7 @@ import git
 import torch
 from torch.utils.data import Dataset
 
-from 
+from datasets import load_from_disk
 
 from transformers import BartTokenizer, RagTokenizer, T5Tokenizer
 
@@ -47,9 +47,7 @@ def trim_batch(
         return (input_ids[:, keep_column_mask], attention_mask[:, keep_column_mask])
 
 
-class KiltDataset(Dataset):
-    def __init__(
-        self,
+def get_kilt_dataset(
         tokenizer,
         data_dir,
         task_name_list_dict: dict,
@@ -58,85 +56,38 @@ class KiltDataset(Dataset):
         gradient_accumulation_steps: int=1,
         type_path: str="train",
         n_obs:int=None,
-        src_lang=None,
-        tgt_lang=None,
         prefix="",
-    ):
-        super().__init__()
+    ) -> Dataset:
+    """
 
-        self.dataset = self.get_char_lens(self.src_file)
-        self.max_source_length = max_source_length
-        self.max_target_length = max_target_length
-        assert min(self.src_lens) > 0, f"found empty line in {self.src_file}"
-        self.tokenizer = tokenizer
-        self.prefix = prefix
-        if n_obs is not None:
-            self.src_lens = self.src_lens[:n_obs]
-        self.src_lang = src_lang
-        self.tgt_lang = tgt_lang
+    """
+    dataset = load_from_disk(data_dir).get(type_path)
+
+    source_tokenizer = (
+        tokenizer.question_encoder if isinstance(tokenizer, RagTokenizer)  else tokenizer
+    )
+    target_tokenizer = tokenizer.generator if isinstance(tokenizer, RagTokenizer) else tokenizer
 
 
-    def __len__(self):
-        return len(self.src_lens)
-
-    def __getitem__(self, index) -> Dict[str, torch.Tensor]:
-        index = index + 1  # linecache starts at 1
-        source_line = self.prefix + linecache.getline(str(self.src_file), index).rstrip("\n")
-        tgt_line = linecache.getline(str(self.tgt_file), index).rstrip("\n")
-        assert source_line, f"empty source line for index {index}"
-        assert tgt_line, f"empty tgt line for index {index}"
-
-        # Need to add eos token manually for T5
-        if isinstance(self.tokenizer, T5Tokenizer):
-            source_line += self.tokenizer.eos_token
-            tgt_line += self.tokenizer.eos_token
-
-        # TODO: prepend prompt into source.
-
-        # Pad source and target to the right
-        source_tokenizer = (
-            self.tokenizer.question_encoder if isinstance(self.tokenizer, RagTokenizer) else self.tokenizer
+    def _tokenize(documents: dict, truncation=True, return_tensors='np', padding='max_length') -> dict:
+        """Tokenize inputs and labels"""
+        input_ids = source_tokenizer(
+            documents["input_"], 
+            truncation=truncation, 
+            padding=padding, 
+            return_tensors=return_tensors
         )
-        target_tokenizer = self.tokenizer.generator if isinstance(self.tokenizer, RagTokenizer) else self.tokenizer
-
-        source_inputs = encode_line(source_tokenizer, source_line, self.max_source_length, "right")
-        target_inputs = encode_line(target_tokenizer, tgt_line, self.max_target_length, "right")
-
-        source_ids = source_inputs["input_ids"].squeeze()
-        target_ids = target_inputs["input_ids"].squeeze()
-        src_mask = source_inputs["attention_mask"].squeeze()
-        return {
-            "input_ids": source_ids,
-            "attention_mask": src_mask,
-            "decoder_input_ids": target_ids,
-        }
-
-    @staticmethod
-    def get_char_lens(data_file):
-        return [len(x) for x in Path(data_file).open().readlines()]
-
-    def collate_fn(self, batch) -> Dict[str, torch.Tensor]:
-        input_ids = torch.stack([x["input_ids"] for x in batch])
-        masks = torch.stack([x["attention_mask"] for x in batch])
-        target_ids = torch.stack([x["decoder_input_ids"] for x in batch])
-        tgt_pad_token_id = (
-            self.tokenizer.generator.pad_token_id
-            if isinstance(self.tokenizer, RagTokenizer)
-            else self.tokenizer.pad_token_id
+        outputs = target_tokenizer(
+            documents['output_'],
+            truncation=truncation, 
+            padding=padding, 
+            return_tensors=return_tensors
         )
-        src_pad_token_id = (
-            self.tokenizer.question_encoder.pad_token_id
-            if isinstance(self.tokenizer, RagTokenizer)
-            else self.tokenizer.pad_token_id
-        )
-        y = trim_batch(target_ids, tgt_pad_token_id)
-        source_ids, source_mask = trim_batch(input_ids, src_pad_token_id, attention_mask=masks)
-        batch = {
-            "input_ids": source_ids,
-            "attention_mask": source_mask,
-            "decoder_input_ids": y,
-        }
-        return batch
+        return {"inputs": input_ids['input_ids'], 'decoder_input_ids': outputs['input_ids']}
+
+    dataset = dataset.map(lambda e: _tokenize(e), batched=True)
+    dataset.set_format(type='torch')
+    return dataset
 
 
 logger = getLogger(__name__)
@@ -219,6 +170,15 @@ def f1_score(prediction, ground_truth):
 def exact_match_score(prediction, ground_truth):
     return normalize_answer(prediction) == normalize_answer(ground_truth)
 
+
+def accuracy_score(output_lns, reference_lns):
+    acc = 0
+    for hypo, pred in zip(output_lns, reference_lns):
+        acc += hypo == pred
+    if len(output_lns) > 0:
+        acc /= len(output_lns)
+    return {'acc': acc}
+    
 
 def calculate_exact_match(output_lns: List[str], reference_lns: List[str]) -> Dict:
     assert len(output_lns) == len(reference_lns)

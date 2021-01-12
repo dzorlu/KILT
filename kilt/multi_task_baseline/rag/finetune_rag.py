@@ -44,8 +44,10 @@ from callbacks_rag import (  # noqa: E402 # isort:skipq
 )
 
 from distributed_pytorch_retriever import RagPyTorchDistributedRetriever  # noqa: E402 # isort:skip
-from utils_rag import (  # noqa: E402 # isort:skip
+from utils_kilt_rag import (  # noqa: E402 # isort:skip
     calculate_exact_match,
+    f1_score,
+    accuracy_score,
     flatten_list,
     get_git_info,
     is_rag_model,
@@ -54,10 +56,10 @@ from utils_rag import (  # noqa: E402 # isort:skip
     save_git_info,
     save_json,
     set_extra_model_params,
-    Seq2SeqDataset,
+    get_kilt_dataset,
 )
 
-from utils_rag import KiltDataset 
+from torch.utils.data import Dataset
 
 # need the parent dir module
 sys.path.insert(2, str(Path(__file__).resolve().parents[1]))
@@ -105,10 +107,10 @@ class CustomAccel(DDPAccelerator):
                 module.model.rag.retriever.init_retrieval()
 
 
-class GenerativeQAModule(BaseTransformer):
-    mode = "generative_qa"
+class KILTModule(BaseTransformer):
+    mode = "kilt"
     loss_names = ["loss"]
-    metric_names = ["em"]
+    metric_names = ["em",""]
     val_metric = "em"
 
     def __init__(self, hparams, **kwargs):
@@ -141,13 +143,12 @@ class GenerativeQAModule(BaseTransformer):
                 config.generator.prefix = hparams.prefix
             config.label_smoothing = hparams.label_smoothing
             hparams, config.generator = set_extra_model_params(extra_model_params, hparams, config.generator)
-            if hparams.distributed_retriever == "pytorch":
-                retriever = RagPyTorchDistributedRetriever.from_pretrained(hparams.model_name_or_path, config=config)
-            elif hparams.distributed_retriever == "ray":
-                # The Ray retriever needs the handles to the retriever actors.
-                retriever = RagRayDistributedRetriever.from_pretrained(
-                    hparams.model_name_or_path, hparams.actor_handles, config=config
-                )
+            # initialize custom retriever
+            retriever = RagPyTorchDistributedRetriever.from_pretrained(
+                hparams.model_name_or_path, 
+                config=config,
+            )
+            
             model = self.model_class.from_pretrained(hparams.model_name_or_path, config=config, retriever=retriever)
             prefix = config.question_encoder.prefix
         else:
@@ -314,7 +315,17 @@ class GenerativeQAModule(BaseTransformer):
         save_json(self.metrics, self.metrics_save_path)
 
     def calc_generative_metrics(self, preds, target) -> Dict:
-        return calculate_exact_match(preds, target)
+        # exact match
+        _metric =  calculate_exact_match(preds, target)
+        # f1 metric
+        f1_metric = {'f1': f1_score(preds, target)}
+        # accuracy (strict exact match
+        accuracy_metric = accuracy_score(preds, target)
+        # update all
+        _metric.update(f1_metric)
+        _metric.update(accuracy_metric)
+        return _metric
+
 
     def _generative_step(self, batch: dict) -> dict:
         start_time = time.time()
@@ -345,10 +356,10 @@ class GenerativeQAModule(BaseTransformer):
     def test_epoch_end(self, outputs):
         return self.validation_epoch_end(outputs, prefix="test")
 
-    def get_dataset(self, type_path) -> Seq2SeqDataset:
+    def get_dataset(self, type_path) -> Dataset:
         n_obs = self.n_obs[type_path]
         max_target_length = self.target_lens[type_path]
-        dataset = KiltDataset(
+        dataset = get_kilt_dataset(
             tokenizer=self.tokenizer,
             type_path=type_path,
             n_obs=n_obs,
@@ -363,7 +374,6 @@ class GenerativeQAModule(BaseTransformer):
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
-            collate_fn=dataset.collate_fn,
             shuffle=shuffle,
             num_workers=self.num_workers,
         )
@@ -523,12 +533,12 @@ class GenerativeQAModule(BaseTransformer):
         return parser
 
 
-def main(args=None, model=None) -> GenerativeQAModule:
+def main(args=None, model=None) -> KILTModule:
 
     parser = argparse.ArgumentParser()
     parser = pl.Trainer.add_argparse_args(parser)
-    parser = GenerativeQAModule.add_model_specific_args(parser, os.getcwd())
-    parser = GenerativeQAModule.add_retriever_specific_args(parser)
+    parser = KILTModule.add_model_specific_args(parser, os.getcwd())
+    parser = KILTModule.add_retriever_specific_args(parser)
 
     args = args or parser.parse_args()
 
@@ -574,7 +584,7 @@ def main(args=None, model=None) -> GenerativeQAModule:
     assert args.actor_handles == named_actors
 
     if model is None:
-        model: GenerativeQAModule = GenerativeQAModule(args)
+        model: KILTModule = KILTModule(args)
 
     dataset = Path(args.data_dir).name
     if (
@@ -624,9 +634,9 @@ def main(args=None, model=None) -> GenerativeQAModule:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser = pl.Trainer.add_argparse_args(parser)
-    parser = GenerativeQAModule.add_model_specific_args(parser, os.getcwd())
-    parser = GenerativeQAModule.add_retriever_specific_args(parser)
-    parser = GenerativeQAModule.add_ray_specific_args(parser)
+    parser = KILTModule.add_model_specific_args(parser, os.getcwd())
+    parser = KILTModule.add_retriever_specific_args(parser)
+    parser = KILTModule.add_ray_specific_args(parser)
 
     # Pytorch Lightning Profiler
     parser.add_argument(
