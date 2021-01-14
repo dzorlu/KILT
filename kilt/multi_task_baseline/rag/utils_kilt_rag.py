@@ -6,6 +6,7 @@ import pickle
 import re
 import socket
 import string
+from rouge import Rouge
 from collections import Counter
 from logging import getLogger
 from pathlib import Path
@@ -16,6 +17,7 @@ import torch
 from torch.utils.data import Dataset
 
 from datasets import load_from_disk
+import numpy as np
 
 from transformers import BartTokenizer, RagTokenizer, T5Tokenizer
 
@@ -47,47 +49,149 @@ def trim_batch(
         return (input_ids[:, keep_column_mask], attention_mask[:, keep_column_mask])
 
 
-def get_kilt_dataset(
+class KILTDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
         tokenizer,
         data_dir,
-        task_name_list_dict: dict,
         max_source_length,
         max_target_length,
-        gradient_accumulation_steps: int=1,
         type_path: str="train",
-        n_obs:int=None,
-        prefix="",
-    ) -> Dataset:
-    """
+        nb_max_answers: int=5,
+        nb_max_wiki_per_answer: int=5,
+        prefix=""):
+        
+        self.task_map = {'wow': 0,
+             'eli5': 1,
+             'fever': 2,
+             'aidayago2': 3,
+             'wned': 4,
+             'cweb': 5,
+             'trex': 6,
+             'structured_zeroshot': 7,
+             'nq': 8,
+             'hotpotqa': 9,
+             'triviaqa_support_only': 10
+        }
+        
+        self.type_path = type_path
 
-    """
-    dataset = load_from_disk(data_dir).get(type_path)
+        self.max_source_length = max_source_length
+        self.max_target_length = max_target_length
+        # for eval and test.
+        self.nb_max_answers = nb_max_answers
+        self.nb_max_wiki_per_answer = nb_max_wiki_per_answer
+        self.type_path = type_path
+        
+        self.dataset = load_from_disk(data_dir).get(type_path)
 
-    source_tokenizer = (
-        tokenizer.question_encoder if isinstance(tokenizer, RagTokenizer)  else tokenizer
-    )
-    target_tokenizer = tokenizer.generator if isinstance(tokenizer, RagTokenizer) else tokenizer
+        self.source_tokenizer = (
+            tokenizer.question_encoder if isinstance(tokenizer, RagTokenizer)  else tokenizer
+        )
+        self.target_tokenizer = tokenizer.generator if isinstance(tokenizer, RagTokenizer) else tokenizer
+        
+        dataset = self.dataset.map(lambda e: self._map(e), batched=True)
+        dataset.set_format(type='torch', columns=['input_ids', 'attention_masks', 'decoder_input_ids', 'wiki_ids', 'task_names'])
+        self.dataset = dataset
+        print(self.dataset[0])
 
 
-    def _tokenize(documents: dict, truncation=True, return_tensors='np', padding='max_length') -> dict:
+    def _map(self, documents: dict, truncation=True, return_tensors='np', padding='max_length') -> dict:
         """Tokenize inputs and labels"""
-        input_ids = source_tokenizer(
+
+        input_ids = self.source_tokenizer(
             documents["input_"], 
             truncation=truncation, 
             padding=padding, 
+            max_length=self.max_source_length,
             return_tensors=return_tensors
         )
-        outputs = target_tokenizer(
-            documents['output_'],
-            truncation=truncation, 
-            padding=padding, 
-            return_tensors=return_tensors
-        )
-        return {"inputs": input_ids['input_ids'], 'decoder_input_ids': outputs['input_ids']}
+        
+        if self.type_path == 'train':
+            # single answer
+            batch_answers_flat = [o[0]['answer'] for o in documents['output_']]
+            batch_wiki_ids = [-1] * len(batch_answers_flat)
 
-    dataset = dataset.map(lambda e: _tokenize(e), batched=True)
-    dataset.set_format(type='torch')
-    return dataset
+            decoder_input_ids = self.target_tokenizer(
+                batch_answers_flat,
+                truncation=truncation, 
+                padding=padding, 
+                max_length=self.max_target_length,
+                return_tensors=return_tensors
+            )['input_ids']
+        else:
+            # validation and test
+            # multiple answers per each output
+            batch_answers = list()
+            batch_wiki_ids = [list()]
+            
+            for o in documents['output_']:
+                _answers = list()
+                _wiki_ids = list()
+                for answer in o[:self.nb_max_answers]:
+                    _answers.append(answer['answer'])
+                    # an answer might have multiple provanences
+                    _wiki_ids = list()
+                    for wid in answer['wid']:
+                        if wid['id'] is not None:
+                            _wiki_ids.append(int(wid['id']))
+                    if len(_wiki_ids) < self.nb_max_wiki_per_answer:
+                        nb_slots = self.nb_max_wiki_per_answer - len(_wiki_ids)
+                        [_wiki_ids.append(-1) for _ in range(nb_slots)]
+                    batch_wiki_ids.append(_wiki_ids)
+                if len(_answers) < self.nb_max_answers:
+                    nb_slots = self.nb_max_answers - len(_answers)
+                    [_answers.append('') for _ in range(nb_slots)]
+                    [batch_wiki_ids.append([-1] * self.nb_max_wiki_per_answer) for _ in range(nb_slots)]
+                batch_answers.append(_answers)
+                
+            batch_answers_flat = list(chain.from_iterable(batch_answers))
+            batch_wiki_ids = list(chain.from_iterable(batch_wiki_ids))
+            
+            batch_wiki_ids = np.array(batch_wiki_ids)
+
+            outputs = self.target_tokenizer(
+                batch_answers_flat,
+                truncation=truncation, 
+                padding=padding, 
+                max_length=self.max_target_length,
+                return_tensors=return_tensors
+            )
+            # [B, nb_max_answers, max_length_target]
+            decoder_input_ids = outputs['input_ids'].reshape(-1, self.nb_max_answers, self.max_target_length)
+            #print(decoder_input_ids.shape)
+            # [B, nb_max_answers, nb_max_wiki_per_answer]
+            batch_wiki_ids = batch_wiki_ids.reshape(-1, self.nb_max_answers, self.nb_max_wiki_per_answer)
+            
+        #print(documents['task_name'])
+        task_names = np.array([self.task_map[n] for n in documents['task_name']]).squeeze()
+        #print(task_names)
+        return {
+            "input_ids": input_ids['input_ids'],
+            "attention_masks": input_ids['attention_mask'],
+            'decoder_input_ids': decoder_input_ids,
+            'wiki_ids': batch_wiki_ids,
+            'task_names': task_names,
+            }
+    
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        _dt = self.dataset[index]
+        if not isinstance(_dt['decoder_input_ids'], torch.Tensor):
+            decoder_input_ids = torch.stack(_dt['decoder_input_ids'])
+            wiki_ids = torch.stack(_dt['wiki_ids'])
+        else:
+            decoder_input_ids = _dt['decoder_input_ids']
+            wiki_ids = _dt['wiki_ids']   
+        return {
+            "input_ids": _dt['input_ids'],
+            'decoder_input_ids':  decoder_input_ids,
+            "attention_masks":_dt['attention_masks'],
+            'wiki_ids': wiki_ids,
+            'task_names': _dt['task_names'],                                     
+        }
 
 
 logger = getLogger(__name__)
@@ -129,6 +233,18 @@ def lmap(f: Callable, x: Iterable) -> List:
     return list(map(f, x))
 
 
+def lmap_inv(x: Iterable, y: Iterable) -> List[List]:
+    """turn y into x-like"""
+    x_like = list()
+    _size = len(y) // len(x)
+    for _ in y:
+        _temp = list()
+        for _ in range(_size):
+            _temp.append(y.pop(0))
+        x_like.append(_temp)
+    return x_like
+
+
 def pickle_save(obj, path):
     """pickle.dump(obj, path)"""
     with open(path, "wb") as f:
@@ -154,6 +270,13 @@ def normalize_answer(s):
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 
+def metric_max_over_ground_truths(metric_fn, prediction, ground_truths):
+    scores_for_ground_truths = []
+    for ground_truth in ground_truths:
+        score = metric_fn(prediction, ground_truth)
+        scores_for_ground_truths.append(score)
+    return max(scores_for_ground_truths)
+
 def f1_score(prediction, ground_truth):
     prediction_tokens = normalize_answer(prediction).split()
     ground_truth_tokens = normalize_answer(ground_truth).split()
@@ -177,8 +300,16 @@ def accuracy_score(output_lns, reference_lns):
         acc += hypo == pred
     if len(output_lns) > 0:
         acc /= len(output_lns)
-    return {'acc': acc}
+    return acc
     
+def rougel_score(prediction, ground_truth):
+    rouge = Rouge()
+    try:
+        scores = rouge.get_scores(prediction, ground_truth, avg=True)
+    except ValueError:
+        return 0.0
+    return scores["rouge-l"]["f"]
+
 
 def calculate_exact_match(output_lns: List[str], reference_lns: List[str]) -> Dict:
     assert len(output_lns) == len(reference_lns)
@@ -187,7 +318,7 @@ def calculate_exact_match(output_lns: List[str], reference_lns: List[str]) -> Di
         em += exact_match_score(hypo, pred)
     if len(output_lns) > 0:
         em /= len(output_lns)
-    return {"em": em}
+    return em
 
 
 def is_rag_model(model_prefix):

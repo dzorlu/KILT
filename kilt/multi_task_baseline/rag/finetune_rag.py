@@ -46,7 +46,10 @@ from callbacks_rag import (  # noqa: E402 # isort:skipq
 from distributed_pytorch_retriever import RagPyTorchDistributedRetriever  # noqa: E402 # isort:skip
 from utils_kilt_rag import (  # noqa: E402 # isort:skip
     calculate_exact_match,
+    metric_max_over_ground_truths,
     f1_score,
+    rougel_score,
+    lmap_inv,
     accuracy_score,
     flatten_list,
     get_git_info,
@@ -56,7 +59,7 @@ from utils_kilt_rag import (  # noqa: E402 # isort:skip
     save_git_info,
     save_json,
     set_extra_model_params,
-    get_kilt_dataset,
+    KILTDataset,
 )
 
 from torch.utils.data import Dataset
@@ -110,7 +113,6 @@ class CustomAccel(DDPAccelerator):
 class KILTModule(BaseTransformer):
     mode = "kilt"
     loss_names = ["loss"]
-    metric_names = ["em",""]
     val_metric = "em"
 
     def __init__(self, hparams, **kwargs):
@@ -209,9 +211,15 @@ class KILTModule(BaseTransformer):
         self.distributed_retriever = hparams.distributed_retriever
 
     def forward(self, input_ids, **kwargs):
-        return self.model(input_ids, **kwargs)
-
+        return self.model(input_ids, **kwargs) 
+    
+    def maybe_reshape(self, generated_ids):
+        if len(generated_ids.shape) == 3:
+            generated_ids = generated_ids.reshape(-1, generated_ids.shape[-1])
+        return generated_ids
+            
     def ids_to_clean_text(self, generated_ids: List[int]):
+        generated_ids = self.maybe_reshape(generated_ids)
         gen_text = self.tokenizer.batch_decode(
             generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
         )
@@ -257,79 +265,69 @@ class KILTModule(BaseTransformer):
         )
 
         loss = outputs["loss"]
-        return (loss,)
+        self.log('loss', loss)
+        return loss
 
     @property
     def pad(self) -> int:
         raise NotImplementedError("pad not implemented")
 
+    # step functions
     def training_step(self, batch, batch_idx) -> Dict:
-        loss_tensors = self._step(batch)
+        return self._step(batch)
 
-        logs = {name: loss for name, loss in zip(self.loss_names, loss_tensors)}
-        # tokens per batch
-        tgt_pad_token_id = (
-            self.tokenizer.generator.pad_token_id
-            if isinstance(self.tokenizer, RagTokenizer)
-            else self.tokenizer.pad_token_id
-        )
-        src_pad_token_id = (
-            self.tokenizer.question_encoder.pad_token_id
-            if isinstance(self.tokenizer, RagTokenizer)
-            else self.tokenizer.pad_token_id
-        )
-        logs["tpb"] = (
-            batch["input_ids"].ne(src_pad_token_id).sum() + batch["decoder_input_ids"].ne(tgt_pad_token_id).sum()
-        )
 
-        return {"loss": loss_tensors[0], "log": logs}
+    def test_step(self, batch, batch_idx):
+        return self._generative_step(batch, 'test')
+
 
     def validation_step(self, batch, batch_idx) -> Dict:
-        return self._generative_step(batch)
-
-    def validation_epoch_end(self, outputs, prefix="val") -> Dict:
-        self.step_count += 1
-        losses = {k: torch.stack([x[k] for x in outputs]).mean() for k in self.loss_names}
-        loss = losses["loss"]
-        gen_metrics = {
-            k: np.array([x[k] for x in outputs]).mean() for k in self.metric_names + ["gen_time", "gen_len"]
-        }
-        metrics_tensor: torch.FloatTensor = torch.tensor(gen_metrics[self.val_metric]).type_as(loss)
-        gen_metrics.update({k: v.item() for k, v in losses.items()})
-
-        # fix for https://github.com/PyTorchLightning/pytorch-lightning/issues/2424
-        if dist.is_initialized():
-            dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
-            metrics_tensor = metrics_tensor / dist.get_world_size()
-            gen_metrics.update({self.val_metric: metrics_tensor.item()})
-
-        losses.update(gen_metrics)
-        metrics = {f"{prefix}_avg_{k}": x for k, x in losses.items()}
-        metrics["step_count"] = self.step_count
-        self.save_metrics(metrics, prefix)  # writes to self.metrics_save_path
-        preds = flatten_list([x["preds"] for x in outputs])
-        return {"log": metrics, "preds": preds, f"{prefix}_loss": loss, f"{prefix}_{self.val_metric}": metrics_tensor}
-
-    def save_metrics(self, latest_metrics, type_path) -> None:
-        self.metrics[type_path].append(latest_metrics)
-        save_json(self.metrics, self.metrics_save_path)
-
-    def calc_generative_metrics(self, preds, target) -> Dict:
-        # exact match
-        _metric =  calculate_exact_match(preds, target)
-        # f1 metric
-        f1_metric = {'f1': f1_score(preds, target)}
-        # accuracy (strict exact match
-        accuracy_metric = accuracy_score(preds, target)
-        # update all
-        _metric.update(f1_metric)
-        _metric.update(accuracy_metric)
-        return _metric
+        return self._generative_step(batch, 'val')
 
 
-    def _generative_step(self, batch: dict) -> dict:
+    # def save_metrics(self, latest_metrics, type_path) -> None:
+    #     self.metrics[type_path].append(latest_metrics)
+    #     save_json(self.metrics, self.metrics_save_path)
+
+    def calc_generative_metrics(self, preds, target, prefix) -> None:
+        if len(preds) != len(target):
+            target = lmap_inv(preds, target)
+
+        batch_em, batch_f1, batch_acc, batch_rougel, total = 0, 0, 0, 0, 0
+        for pr, gt in zip(preds, target):
+            total += 1
+            # exact match
+            batch_em += metric_max_over_ground_truths(calculate_exact_match, pr, gt)
+            # f1 metric
+            batch_f1 += metric_max_over_ground_truths(f1_score, pr, gt)
+            # accuracy (strict exact match)
+            batch_acc += metric_max_over_ground_truths(accuracy_score, pr, gt)
+            # rougel_score
+            batch_rougel += metric_max_over_ground_truths(rougel_score, pr, gt)
+        # update batch avg
+        batch_em /= total
+        batch_f1 /= total
+        batch_acc /= total
+        batch_rougel /= total
+
+        return {
+            f'{prefix}_em': batch_em, 
+            f'{prefix}_f1':batch_f1,
+            f'{prefix}_acc': batch_acc,
+            f'{prefix}_rougel': batch_rougel
+            }
+
+
+    def calculate_retrieval_metrics(self, preds, target, prefix) -> None:
+        pass
+
+
+    def _generative_step(self, batch: dict, prefix: str) -> dict:
         start_time = time.time()
         batch = BatchEncoding(batch).to(device=self.model.device)
+        # retrieval
+
+        # downstream
         generated_ids = self.model.generate(
             batch["input_ids"],
             attention_mask=batch["attention_mask"],
@@ -341,28 +339,25 @@ class KILTModule(BaseTransformer):
 
         gen_time = (time.time() - start_time) / batch["input_ids"].shape[0]
         preds: List[str] = self.ids_to_clean_text(generated_ids)
+
         target: List[str] = self.ids_to_clean_text(batch["decoder_input_ids"])
+
         loss_tensors = self._step(batch)
         base_metrics = {name: loss for name, loss in zip(self.loss_names, loss_tensors)}
-        gen_metrics: Dict = self.calc_generative_metrics(preds, target)
+
+        gen_metrics: Dict = self.calc_generative_metrics(preds, target, prefix)
 
         summ_len = np.mean(lmap(len, generated_ids))
-        base_metrics.update(gen_time=gen_time, gen_len=summ_len, preds=preds, target=target, **gen_metrics)
-        return base_metrics
+        gen_metrics.update({'gen_time': gen_time, 'summ_len': summ_len, **base_metrics})
 
-    def test_step(self, batch, batch_idx):
-        return self._generative_step(batch)
+        self.log_dict(gen_metrics, prog_bar=True)
 
-    def test_epoch_end(self, outputs):
-        return self.validation_epoch_end(outputs, prefix="test")
 
     def get_dataset(self, type_path) -> Dataset:
-        n_obs = self.n_obs[type_path]
         max_target_length = self.target_lens[type_path]
-        dataset = get_kilt_dataset(
+        dataset = KILTDataset(
             tokenizer=self.tokenizer,
             type_path=type_path,
-            n_obs=n_obs,
             max_target_length=max_target_length,
             **self.dataset_kwargs,
         )
@@ -384,7 +379,7 @@ class KILTModule(BaseTransformer):
         return dataloader
 
     def val_dataloader(self) -> DataLoader:
-        return self.get_dataloader("val", batch_size=self.hparams.eval_batch_size)
+        return self.get_dataloader("validation", batch_size=self.hparams.eval_batch_size)
 
     def test_dataloader(self) -> DataLoader:
         return self.get_dataloader("test", batch_size=self.hparams.eval_batch_size)
