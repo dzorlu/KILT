@@ -45,6 +45,7 @@ from callbacks_rag import (  # noqa: E402 # isort:skipq
 
 from distributed_pytorch_retriever import RagPyTorchDistributedRetriever  # noqa: E402 # isort:skip
 from utils_kilt_rag import (  # noqa: E402 # isort:skip
+    calculate_rprecision,
     calculate_exact_match,
     metric_max_over_ground_truths,
     f1_score,
@@ -225,7 +226,7 @@ class KILTModule(BaseTransformer):
         )
         return lmap(str.strip, gen_text)
 
-    def _step(self, batch: dict) -> Tuple:
+    def _step(self, batch: dict) -> float:
         source_ids, source_mask, target_ids = batch["input_ids"], batch["attention_mask"], batch["decoder_input_ids"]
 
         rag_kwargs = {}
@@ -271,8 +272,11 @@ class KILTModule(BaseTransformer):
     @property
     def pad(self) -> int:
         raise NotImplementedError("pad not implemented")
+    
+    ##################
+    # step functions #
+    ##################
 
-    # step functions
     def training_step(self, batch, batch_idx) -> Dict:
         return self._step(batch)
 
@@ -280,53 +284,49 @@ class KILTModule(BaseTransformer):
     def test_step(self, batch, batch_idx):
         return self._generative_step(batch, 'test')
 
-
     def validation_step(self, batch, batch_idx) -> Dict:
         return self._generative_step(batch, 'val')
 
+    def test_epoch_end(self, outputs):
+        return self.validation_epoch_end(outputs, 'test')
 
-    # def save_metrics(self, latest_metrics, type_path) -> None:
-    #     self.metrics[type_path].append(latest_metrics)
-    #     save_json(self.metrics, self.metrics_save_path)
+    def save_metrics(self, latest_metrics, type_path) -> None:
+        self.metrics[type_path].append(latest_metrics)
+        save_json(self.metrics, self.metrics_save_path)
 
-    def calc_generative_metrics(self, preds, target, prefix) -> None:
+    def calc_generative_metrics(self, preds, target) -> Dict:
         if len(preds) != len(target):
             target = lmap_inv(preds, target)
 
-        batch_em, batch_f1, batch_acc, batch_rougel, total = 0, 0, 0, 0, 0
+        batch_em, batch_f1, batch_acc, batch_rougel, total = [], [], [], [], []
         for pr, gt in zip(preds, target):
             total += 1
             # exact match
-            batch_em += metric_max_over_ground_truths(calculate_exact_match, pr, gt)
+            batch_em.append(
+                metric_max_over_ground_truths(calculate_exact_match, pr, gt)
+            )
             # f1 metric
-            batch_f1 += metric_max_over_ground_truths(f1_score, pr, gt)
+            batch_f1.append(
+                metric_max_over_ground_truths(f1_score, pr, gt)         
+            )
             # accuracy (strict exact match)
-            batch_acc += metric_max_over_ground_truths(accuracy_score, pr, gt)
+            batch_acc.append(
+                metric_max_over_ground_truths(accuracy_score, pr, gt)
+            )
             # rougel_score
-            batch_rougel += metric_max_over_ground_truths(rougel_score, pr, gt)
-        # update batch avg
-        batch_em /= total
-        batch_f1 /= total
-        batch_acc /= total
-        batch_rougel /= total
+            batch_rougel.append(
+                metric_max_over_ground_truths(rougel_score, pr, gt)
+            )
 
         return {
-            f'{prefix}_em': batch_em, 
-            f'{prefix}_f1':batch_f1,
-            f'{prefix}_acc': batch_acc,
-            f'{prefix}_rougel': batch_rougel
-            }
+            f'em': batch_em, 
+            f'f1':batch_f1,
+            f'acc': batch_acc,
+            f'rougel': batch_rougel,
+            f'total': total
+        }
 
-
-    def calculate_retrieval_metrics(self, preds, target, prefix) -> None:
-        pass
-
-
-    def _generative_step(self, batch: dict, prefix: str) -> dict:
-        start_time = time.time()
-        batch = BatchEncoding(batch).to(device=self.model.device)
-        # retrieval
-
+    def calculate_downstream_metrics(self, batch: dict) -> Dict:
         # downstream
         generated_ids = self.model.generate(
             batch["input_ids"],
@@ -336,21 +336,84 @@ class KILTModule(BaseTransformer):
             min_length=1,
             max_length=self.target_lens["val"],
         )
-
-        gen_time = (time.time() - start_time) / batch["input_ids"].shape[0]
         preds: List[str] = self.ids_to_clean_text(generated_ids)
 
         target: List[str] = self.ids_to_clean_text(batch["decoder_input_ids"])
+        
+        gen_metrics: Dict = self.calc_generative_metrics(preds, target)
+        return gen_metrics
+
+
+    def calculate_retrieval_metrics(self, batch: dict, n_docs: int=5) -> Dict:
+        # retrieval
+        question_enc_outputs = self.model.rag.question_encoder(
+            batch["input_ids"], 
+            attention_mask=batch["attention_mask"]
+        )
+        question_enc_pool_output = question_enc_outputs[0].detach().numpy()
+
+        doc_ids = self.model.rag.retriever(
+            batch["input_ids"],
+            question_enc_pool_output,
+            prefix=self.generator.config.prefix,
+            n_docs=n_docs, #TODO: INHERIT
+            return_tensors="pt",
+        )['doc_ids'] #[B, n_docs]
+        gt = batch['wiki_ids'].detach().numpy() # [B, A, P]
+        batch_rprecision = calculate_rprecision(doc_ids, gt)
+        return {'rprecision': batch_rprecision}
+
+
+    def aggregate_metrics_by_task(self, task_names: np.ndarray, metrics: dict) -> Dict:
+        """
+        returns {'prefix_metric_task_id': [m1, m2, ...]}
+        """
+        prefix = 'val'
+        metrics_agg = defaultdict(list)
+        for m_name, vals in metrics.items():  
+            for val, tid in zip(vals, task_names):
+                _name = '_'.join([prefix, m_name, str(tid)])
+                metrics_agg[_name].append(val)
+        return metrics_agg
+
+    def _generative_step(self, batch: dict, prefix: str, n_docs: int=5) -> Dict:
+        """
+            returns: {agg_metric1: [], agg_metric2: [], .. , gen_time: float, loss: float}
+        """
+        start_time = time.time()
+        # DO I NEED THIS?
+        #batch = BatchEncoding(batch)
+        batch_rprecision = self.calculate_retrieval_metrics(batch)
+        batch_metrics = self.calculate_downstream_metrics(batch)
+        gen_time = (time.time() - start_time) / batch["input_ids"].shape[0]
+        assert len(list(batch_rprecision.values())[0]) == len(list(batch_metrics.values())[0])
+        batch_metrics.update(batch_rprecision)
+
+        task_names = batch['task_names'].detach().numpy()
+        batch_metrics_agg = self.aggregate_metrics_by_task(task_names, batch_metrics)
+
 
         loss_tensors = self._step(batch)
         base_metrics = {name: loss for name, loss in zip(self.loss_names, loss_tensors)}
+        base_metrics.update({'gen_time': gen_time})
+        self.log_dict(base_metrics, prog_bar=True)
+        
+        return batch_metrics_agg
 
-        gen_metrics: Dict = self.calc_generative_metrics(preds, target, prefix)
 
-        summ_len = np.mean(lmap(len, generated_ids))
-        gen_metrics.update({'gen_time': gen_time, 'summ_len': summ_len, **base_metrics})
-
-        self.log_dict(gen_metrics, prog_bar=True)
+    def validation_epoch_end(self, outputs, prefix='val') -> Dict:
+        self.step_count += 1
+        metrics = outputs[0].keys()
+        epoch_metrics = dict()
+        for m in metrics:
+            magg = list()
+            for o in outputs:
+                magg.append(o[m])
+            epoch_metrics[m] = np.array(magg).mean()
+        epoch_metrics['step_count'] = self.step_count
+        # writes epoch metrics to self.metrics_save_path
+        self.save_metrics(epoch_metrics, prefix)  
+        self.log_dict(epoch_metrics)
 
 
     def get_dataset(self, type_path) -> Dataset:

@@ -320,9 +320,34 @@ def calculate_exact_match(output_lns: List[str], reference_lns: List[str]) -> Di
         em /= len(output_lns)
     return em
 
+def _computeRprec(guess_ids, gold_ids):
+    gold_ids = set([g for g in gold_ids if g >0]) #remove padding
+    R = len(gold_ids)
+    num = 0
+
+    for prediction in guess_ids[:R]:
+        if prediction in gold_ids:
+            num += 1
+
+    Rprec = num / R if R > 0 else 0
+    return Rprec
+
+
+# R-precision https://link.springer.com/referenceworkentry/10.1007%2F978-0-387-39940-9_486
+def calculate_rprecision(guess_items: np.ndarray, gold_items: np.ndarray) -> List:
+    Rprec_vector_batch = []
+    for prs, gts in zip(guess_items, gold_items):
+        Rprec_vector = []
+        for gt in gts:
+            Rprec = _computeRprec(prs, gt)
+            Rprec_vector.append(Rprec)
+        Rprec_vector_batch.append(max(Rprec_vector))
+    return Rprec_vector_batch
+
 
 def is_rag_model(model_prefix):
     return model_prefix.startswith("rag")
+
 
 
 def set_extra_model_params(extra_params, hparams, config):
