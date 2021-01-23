@@ -8,6 +8,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from itertools import chain
 
 import numpy as np
 import pytorch_lightning as pl
@@ -46,7 +47,7 @@ from callbacks_rag import (  # noqa: E402 # isort:skipq
 from distributed_pytorch_retriever import RagPyTorchDistributedRetriever  # noqa: E402 # isort:skip
 from utils_kilt_rag import (  # noqa: E402 # isort:skip
     calculate_rprecision,
-    calculate_exact_match,
+    exact_match_score,
     metric_max_over_ground_truths,
     f1_score,
     rougel_score,
@@ -69,11 +70,15 @@ from torch.utils.data import Dataset
 sys.path.insert(2, str(Path(__file__).resolve().parents[1]))
 from lightning_base import BaseTransformer, add_generic_args, generic_train  # noqa
 
+torch.cuda.empty_cache()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 transformers_logging.set_verbosity_info()
+
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class AttrDict(dict):
@@ -137,7 +142,7 @@ class KILTModule(BaseTransformer):
         config.index_name = hparams.index_name or config.index_name
         config.passages_path = hparams.passages_path or config.passages_path
         config.index_path = hparams.index_path or config.index_path
-        config.use_dummy_dataset = hparams.use_dummy_dataset
+        #config.use_dummy_dataset = True
 
         # set extra_model_params for generator configs and load_model
         extra_model_params = ("encoder_layerdrop", "decoder_layerdrop", "attention_dropout", "dropout")
@@ -146,13 +151,14 @@ class KILTModule(BaseTransformer):
                 config.generator.prefix = hparams.prefix
             config.label_smoothing = hparams.label_smoothing
             hparams, config.generator = set_extra_model_params(extra_model_params, hparams, config.generator)
-            # initialize custom retriever
+            #initialize custom retriever
             retriever = RagPyTorchDistributedRetriever.from_pretrained(
                 hparams.model_name_or_path, 
                 config=config,
             )
-            
+        
             model = self.model_class.from_pretrained(hparams.model_name_or_path, config=config, retriever=retriever)
+            
             prefix = config.question_encoder.prefix
         else:
             if hparams.prefix is not None:
@@ -226,8 +232,8 @@ class KILTModule(BaseTransformer):
         )
         return lmap(str.strip, gen_text)
 
-    def _step(self, batch: dict) -> float:
-        source_ids, source_mask, target_ids = batch["input_ids"], batch["attention_mask"], batch["decoder_input_ids"]
+    def _step(self, batch: dict, prefix: str) -> float:
+        source_ids, source_mask, target_ids = batch["input_ids"], batch["attention_masks"], batch["decoder_input_ids"]
 
         rag_kwargs = {}
         if isinstance(self.model, T5ForConditionalGeneration):
@@ -255,7 +261,6 @@ class KILTModule(BaseTransformer):
             rag_kwargs["reduce_loss"] = True
 
         assert decoder_input_ids is not None
-
         outputs = self(
             source_ids,
             attention_mask=source_mask,
@@ -264,9 +269,7 @@ class KILTModule(BaseTransformer):
             labels=lm_labels,
             **rag_kwargs,
         )
-
         loss = outputs["loss"]
-        self.log('loss', loss)
         return loss
 
     @property
@@ -278,7 +281,10 @@ class KILTModule(BaseTransformer):
     ##################
 
     def training_step(self, batch, batch_idx) -> Dict:
-        return self._step(batch)
+        #self.log('train_bla', 1)
+        loss = self._step(batch, 'train')
+        self.log('train_loss', loss)
+        return loss
 
 
     def test_step(self, batch, batch_idx):
@@ -290,6 +296,25 @@ class KILTModule(BaseTransformer):
     def test_epoch_end(self, outputs):
         return self.validation_epoch_end(outputs, 'test')
 
+
+    def validation_epoch_end(self, outputs, prefix='val') -> Dict:
+        self.step_count += 1
+        metrics = [list(b.keys()) for b in outputs]
+        metrics = set(chain.from_iterable(metrics))
+        epoch_metrics = dict()
+        for m in metrics:
+            magg = list()
+            for o in outputs:
+                # a step might not have all metric combinations.
+                if m in o:
+                    magg.extend(o[m])
+            epoch_metrics[m] = np.array(magg).mean()
+        epoch_metrics['step_count'] = self.step_count
+        # writes epoch metrics to self.metrics_save_path
+        self.save_metrics(epoch_metrics, prefix)
+        #logger.info(f"epoch_metrics:{epoch_metrics}")
+        self.log_dict(epoch_metrics)
+
     def save_metrics(self, latest_metrics, type_path) -> None:
         self.metrics[type_path].append(latest_metrics)
         save_json(self.metrics, self.metrics_save_path)
@@ -297,13 +322,12 @@ class KILTModule(BaseTransformer):
     def calc_generative_metrics(self, preds, target) -> Dict:
         if len(preds) != len(target):
             target = lmap_inv(preds, target)
-
-        batch_em, batch_f1, batch_acc, batch_rougel, total = [], [], [], [], []
-        for pr, gt in zip(preds, target):
-            total += 1
+        batch_em, batch_f1, batch_acc, batch_rougel = [], [], [], []
+        for pr, gt in zip(preds, target): #List[str], List[List[str]]
+            #total += 1
             # exact match
             batch_em.append(
-                metric_max_over_ground_truths(calculate_exact_match, pr, gt)
+                metric_max_over_ground_truths(exact_match_score, pr, gt)
             )
             # f1 metric
             batch_f1.append(
@@ -323,23 +347,22 @@ class KILTModule(BaseTransformer):
             f'f1':batch_f1,
             f'acc': batch_acc,
             f'rougel': batch_rougel,
-            f'total': total
+            #f'total': total
         }
 
     def calculate_downstream_metrics(self, batch: dict) -> Dict:
         # downstream
         generated_ids = self.model.generate(
             batch["input_ids"],
-            attention_mask=batch["attention_mask"],
+            attention_mask=batch["attention_masks"],
             do_deduplication=False,  # rag specific parameter
             use_cache=True,
             min_length=1,
             max_length=self.target_lens["val"],
         )
-        preds: List[str] = self.ids_to_clean_text(generated_ids)
+        preds: List[str] = self.ids_to_clean_text(generated_ids) #[B]
 
-        target: List[str] = self.ids_to_clean_text(batch["decoder_input_ids"])
-        
+        target: List[str] = self.ids_to_clean_text(batch["decoder_input_ids"]) #[BxA]
         gen_metrics: Dict = self.calc_generative_metrics(preds, target)
         return gen_metrics
 
@@ -348,18 +371,20 @@ class KILTModule(BaseTransformer):
         # retrieval
         question_enc_outputs = self.model.rag.question_encoder(
             batch["input_ids"], 
-            attention_mask=batch["attention_mask"]
+            attention_mask=batch["attention_masks"]
         )
-        question_enc_pool_output = question_enc_outputs[0].detach().numpy()
+        # faiss requires np.ndarray.
+        question_enc_pool_output = question_enc_outputs[0].detach().cpu().numpy()
+        #question_enc_pool_output = question_enc_outputs[0]
 
         doc_ids = self.model.rag.retriever(
             batch["input_ids"],
             question_enc_pool_output,
-            prefix=self.generator.config.prefix,
+            prefix=self.model.rag.generator.config.prefix,
             n_docs=n_docs, #TODO: INHERIT
             return_tensors="pt",
         )['doc_ids'] #[B, n_docs]
-        gt = batch['wiki_ids'].detach().numpy() # [B, A, P]
+        gt = batch['wiki_ids'].detach().cpu().numpy() # [B, A, P]
         batch_rprecision = calculate_rprecision(doc_ids, gt)
         return {'rprecision': batch_rprecision}
 
@@ -378,7 +403,7 @@ class KILTModule(BaseTransformer):
 
     def _generative_step(self, batch: dict, prefix: str, n_docs: int=5) -> Dict:
         """
-            returns: {agg_metric1: [], agg_metric2: [], .. , gen_time: float, loss: float}
+            returns: {agg_metric1: [], agg_metric2: [], .. }
         """
         start_time = time.time()
         # DO I NEED THIS?
@@ -389,31 +414,28 @@ class KILTModule(BaseTransformer):
         assert len(list(batch_rprecision.values())[0]) == len(list(batch_metrics.values())[0])
         batch_metrics.update(batch_rprecision)
 
-        task_names = batch['task_names'].detach().numpy()
-        batch_metrics_agg = self.aggregate_metrics_by_task(task_names, batch_metrics)
+        task_names = batch['task_names'].detach().cpu().numpy()
+        batch_metrics_by_task = self.aggregate_metrics_by_task(task_names, batch_metrics)
 
-
-        loss_tensors = self._step(batch)
-        base_metrics = {name: loss for name, loss in zip(self.loss_names, loss_tensors)}
-        base_metrics.update({'gen_time': gen_time})
-        self.log_dict(base_metrics, prog_bar=True)
+        # validation / test step data returns [B, A, D] for eval purposes
+        # but for loss calculation take the first one. 
+        # [B, A, D] -> [B, D]
+        batch['decoder_input_ids'] = batch['decoder_input_ids'] \
+            .narrow(dim=1,start=0,length=1) \
+            .squeeze(dim=1)
+        loss_dict = {f'{prefix}_loss': [self._step(batch, prefix).detach().cpu().numpy()]}
+        # base_metrics = {name: loss for name, loss in zip(self.loss_names, [loss_tensors])}
+        # base_metrics.update({'gen_time': gen_time})
         
-        return batch_metrics_agg
-
-
-    def validation_epoch_end(self, outputs, prefix='val') -> Dict:
-        self.step_count += 1
-        metrics = outputs[0].keys()
-        epoch_metrics = dict()
-        for m in metrics:
-            magg = list()
-            for o in outputs:
-                magg.append(o[m])
-            epoch_metrics[m] = np.array(magg).mean()
-        epoch_metrics['step_count'] = self.step_count
-        # writes epoch metrics to self.metrics_save_path
-        self.save_metrics(epoch_metrics, prefix)  
-        self.log_dict(epoch_metrics)
+        # reduce for each step w/o task aggregation
+        #batch_metrics = {f"{prefix}_{k}": np.array(v).mean() for k,v in batch_metrics.items()}
+        batch_metrics = {f"{prefix}_{k}": v for k,v in batch_metrics.items()}
+        #logger.info(batch_metrics)
+        batch_metrics.update(batch_metrics_by_task)
+        batch_metrics.update(loss_dict)
+        #self.log_dict(batch_metrics, prog_bar=False)
+        
+        return batch_metrics # for epoch-end consumption {k: [v],..}
 
 
     def get_dataset(self, type_path) -> Dataset:
@@ -422,6 +444,7 @@ class KILTModule(BaseTransformer):
             tokenizer=self.tokenizer,
             type_path=type_path,
             max_target_length=max_target_length,
+            n_obs=self.n_obs['train'],
             **self.dataset_kwargs,
         )
         return dataset
@@ -438,13 +461,16 @@ class KILTModule(BaseTransformer):
         return dataloader
 
     def train_dataloader(self) -> DataLoader:
+        logger.info('train')
         dataloader = self.get_dataloader("train", batch_size=self.hparams.train_batch_size, shuffle=True)
         return dataloader
 
     def val_dataloader(self) -> DataLoader:
-        return self.get_dataloader("validation", batch_size=self.hparams.eval_batch_size)
+        logger.info('val')
+        return self.get_dataloader("val", batch_size=self.hparams.eval_batch_size)
 
     def test_dataloader(self) -> DataLoader:
+        logger.info('test')
         return self.get_dataloader("test", batch_size=self.hparams.eval_batch_size)
 
     @pl.utilities.rank_zero_only
@@ -486,7 +512,7 @@ class KILTModule(BaseTransformer):
             help="The maximum total input sequence length after tokenization. Sequences longer "
             "than this will be truncated, sequences shorter will be padded.",
         )
-        parser.add_argument("--logger_name", type=str, choices=["default", "wandb", "wandb_shared"], default="default")
+        parser.add_argument("--logger_name", type=str, choices=["default", "wandb", "wandb_shared"], default="wandb")
         parser.add_argument("--n_train", type=int, default=-1, required=False, help="# examples. -1 means use all.")
         parser.add_argument("--n_val", type=int, default=-1, required=False, help="# examples. -1 means use all.")
         parser.add_argument("--n_test", type=int, default=-1, required=False, help="# examples. -1 means use all.")
@@ -565,6 +591,7 @@ class KILTModule(BaseTransformer):
             "for the distributed retriever. Has no effect when "
             "distributed_retriever is set to pytorch.",
         )
+        return parser
 
     @staticmethod
     def add_ray_specific_args(parser):
@@ -645,36 +672,29 @@ def main(args=None, model=None) -> KILTModule:
         model: KILTModule = KILTModule(args)
 
     dataset = Path(args.data_dir).name
-    if (
-        args.logger_name == "default"
-        or args.fast_dev_run
-        or str(args.output_dir).startswith("/tmp")
-        or str(args.output_dir).startswith("/var")
-    ):
-        training_logger = True  # don't pollute wandb logs unnecessarily
-    elif args.logger_name == "wandb":
-        from pytorch_lightning.loggers import WandbLogger
 
-        project = os.environ.get("WANDB_PROJECT", dataset)
-        training_logger = WandbLogger(name=model.output_dir.name, project=project)
+    from pytorch_lightning.loggers import WandbLogger
+    logger.info(f"wandb logger saving under {args.output_dir}..")
 
-    elif args.logger_name == "wandb_shared":
-        from pytorch_lightning.loggers import WandbLogger
-
-        training_logger = WandbLogger(name=model.output_dir.name, project=f"hf_{dataset}")
-
-    es_callback = (
-        get_early_stopping_callback(model.val_metric, args.early_stopping_patience)
-        if args.early_stopping_patience >= 0
-        else False
+    #project = os.environ.get("WANDB_PROJECT", dataset)
+    training_logger = WandbLogger(
+        name=model.output_dir.name, 
+        project="kilt",
+        save_dir=args.output_dir
     )
+
+    # es_callback = (
+    #     get_early_stopping_callback(model.val_metric, args.early_stopping_patience)
+    #     if args.early_stopping_patience >= 0
+    #     else False
+    # )
 
     trainer: pl.Trainer = generic_train(
         model,
         args,
-        logging_callback=Seq2SeqLoggingCallback(),
+        #logging_callback=Seq2SeqLoggingCallback(),
         checkpoint_callback=get_checkpoint_callback(args.output_dir, model.val_metric),
-        early_stopping_callback=es_callback,
+        #early_stopping_callback=es_callback,
         logger=training_logger,
         accelerator=CustomAccel() if args.gpus > 1 else None,
         profiler=pl.profiler.AdvancedProfiler() if args.profile else None,
@@ -694,7 +714,7 @@ if __name__ == "__main__":
     parser = pl.Trainer.add_argparse_args(parser)
     parser = KILTModule.add_model_specific_args(parser, os.getcwd())
     parser = KILTModule.add_retriever_specific_args(parser)
-    parser = KILTModule.add_ray_specific_args(parser)
+    #parser = KILTModule.add_ray_specific_args(parser)
 
     # Pytorch Lightning Profiler
     parser.add_argument(
@@ -704,5 +724,5 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-
+    print(args)
     main(args)

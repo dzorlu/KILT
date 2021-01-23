@@ -15,6 +15,7 @@ from typing import Callable, Dict, Iterable, List
 import git
 import torch
 from torch.utils.data import Dataset
+from itertools import chain
 
 from datasets import load_from_disk
 import numpy as np
@@ -56,6 +57,7 @@ class KILTDataset(torch.utils.data.Dataset):
         data_dir,
         max_source_length,
         max_target_length,
+        n_obs=None,
         type_path: str="train",
         nb_max_answers: int=5,
         nb_max_wiki_per_answer: int=5,
@@ -73,7 +75,7 @@ class KILTDataset(torch.utils.data.Dataset):
              'hotpotqa': 9,
              'triviaqa_support_only': 10
         }
-        
+        if type_path == 'val': type_path = 'validation'
         self.type_path = type_path
 
         self.max_source_length = max_source_length
@@ -93,8 +95,12 @@ class KILTDataset(torch.utils.data.Dataset):
         dataset = self.dataset.map(lambda e: self._map(e), batched=True)
         dataset.set_format(type='torch', columns=['input_ids', 'attention_masks', 'decoder_input_ids', 'wiki_ids', 'task_names'])
         self.dataset = dataset
-        print(self.dataset[0])
+        self.src_lens = len(dataset)
+        if n_obs is not None:
+            self.src_lens = n_obs
 
+    def __len__(self):
+        return self.src_lens
 
     def _map(self, documents: dict, truncation=True, return_tensors='np', padding='max_length') -> dict:
         """Tokenize inputs and labels"""
@@ -173,9 +179,6 @@ class KILTDataset(torch.utils.data.Dataset):
             'wiki_ids': batch_wiki_ids,
             'task_names': task_names,
             }
-    
-    def __len__(self):
-        return len(self.dataset)
 
     def __getitem__(self, index):
         _dt = self.dataset[index]
@@ -237,13 +240,12 @@ def lmap_inv(x: Iterable, y: Iterable) -> List[List]:
     """turn y into x-like"""
     x_like = list()
     _size = len(y) // len(x)
-    for _ in y:
+    while y:
         _temp = list()
         for _ in range(_size):
             _temp.append(y.pop(0))
         x_like.append(_temp)
     return x_like
-
 
 def pickle_save(obj, path):
     """pickle.dump(obj, path)"""
@@ -270,7 +272,7 @@ def normalize_answer(s):
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 
-def metric_max_over_ground_truths(metric_fn, prediction, ground_truths):
+def metric_max_over_ground_truths(metric_fn, prediction: str, ground_truths: list):
     scores_for_ground_truths = []
     for ground_truth in ground_truths:
         score = metric_fn(prediction, ground_truth)
@@ -294,13 +296,8 @@ def exact_match_score(prediction, ground_truth):
     return normalize_answer(prediction) == normalize_answer(ground_truth)
 
 
-def accuracy_score(output_lns, reference_lns):
-    acc = 0
-    for hypo, pred in zip(output_lns, reference_lns):
-        acc += hypo == pred
-    if len(output_lns) > 0:
-        acc /= len(output_lns)
-    return acc
+def accuracy_score(prediction, ground_truth):
+    return prediction == ground_truth
     
 def rougel_score(prediction, ground_truth):
     rouge = Rouge()
@@ -311,17 +308,16 @@ def rougel_score(prediction, ground_truth):
     return scores["rouge-l"]["f"]
 
 
-def calculate_exact_match(output_lns: List[str], reference_lns: List[str]) -> Dict:
-    assert len(output_lns) == len(reference_lns)
-    em = 0
-    for hypo, pred in zip(output_lns, reference_lns):
-        em += exact_match_score(hypo, pred)
-    if len(output_lns) > 0:
-        em /= len(output_lns)
-    return em
+# def calculate_exact_match(output_lns: List[str], reference_lns: List[str]) -> Dict:
+#     em = 0
+#     for hypo, pred in zip(output_lns, reference_lns):
+#         em += exact_match_score(hypo, pred)
+#     if len(output_lns) > 0:
+#         em /= len(output_lns)
+#     return em
 
 def _computeRprec(guess_ids, gold_ids):
-    gold_ids = set([g for g in gold_ids if g >0]) #remove padding
+    gold_ids = set([g for g in gold_ids if g > 0]) #remove padding
     R = len(gold_ids)
     num = 0
 

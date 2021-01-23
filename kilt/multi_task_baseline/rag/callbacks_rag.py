@@ -45,7 +45,7 @@ def get_checkpoint_callback(output_dir, metric):
 
 def get_early_stopping_callback(metric, patience):
     return EarlyStopping(
-        monitor=f"val_{metric}",  # does this need avg?
+       # monitor=f"val_{metric}",  # does this need avg?
         mode="min" if "loss" in metric else "max",
         patience=patience,
         verbose=True,

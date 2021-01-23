@@ -271,8 +271,12 @@ class BaseTransformer(pl.LightningModule):
 class LoggingCallback(pl.Callback):
     def on_batch_end(self, trainer, pl_module):
         lr_scheduler = trainer.lr_schedulers[0]["scheduler"]
+        # logger.info(f"callback_metrics: {trainer.callback_metrics}")
+        # logger.info(f"logged_metrics: {trainer.logged_metrics}"")
         lrs = {f"lr_group_{i}": lr for i, lr in enumerate(lr_scheduler.get_lr())}
-        pl_module.logger.log_metrics(lrs)
+        # commented this out bc somehow it interferes w/ logging the loss function
+        # by app increasing the step in wandb module.
+        #pl_module.logger.log_metrics(lrs,)
 
     def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         rank_zero_info("***** Validation results *****")
@@ -334,7 +338,7 @@ def add_generic_args(parser, root_dir) -> None:
         default=None,
         type=str,
         required=True,
-        help="The input data dir. Should contain the training files for the CoNLL-2003 NER task.",
+        help="The input data dir. Should contain the training files for the KILT task.",
     )
 
 
@@ -366,10 +370,10 @@ def generic_train(
 
     train_params = {}
 
-    # TODO: remove with PyTorch 1.6 since pl uses native amp
+    
     if args.fp16:
         train_params["precision"] = 16
-        train_params["amp_level"] = args.fp16_opt_level
+        #train_params["amp_level"] = args.fp16_opt_level
 
     if args.gpus > 1:
         train_params["distributed_backend"] = "ddp"
@@ -377,6 +381,7 @@ def generic_train(
     train_params["accumulate_grad_batches"] = args.accumulate_grad_batches
     train_params["accelerator"] = extra_train_kwargs.get("accelerator", None)
     train_params["profiler"] = extra_train_kwargs.get("profiler", None)
+    train_params['num_sanity_val_steps'] = 0 #disable eval sanity check.
 
     trainer = pl.Trainer.from_argparse_args(
         args,
