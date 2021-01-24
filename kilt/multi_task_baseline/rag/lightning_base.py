@@ -381,7 +381,7 @@ def generic_train(
     train_params["accumulate_grad_batches"] = args.accumulate_grad_batches
     train_params["accelerator"] = extra_train_kwargs.get("accelerator", None)
     train_params["profiler"] = extra_train_kwargs.get("profiler", None)
-    train_params['num_sanity_val_steps'] = 0 #disable eval sanity check.
+    train_params['num_sanity_val_steps'] = 100 #disable eval sanity check.
 
     trainer = pl.Trainer.from_argparse_args(
         args,

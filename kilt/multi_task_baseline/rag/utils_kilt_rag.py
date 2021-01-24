@@ -23,6 +23,13 @@ import numpy as np
 from transformers import BartTokenizer, RagTokenizer, T5Tokenizer
 
 
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return json.JSONEncoder.default(self, obj)
+
+
 def encode_line(tokenizer, line, max_length, padding_side, pad_to_max_length=True, return_tensors="pt"):
     extra_kw = {"add_prefix_space": True} if isinstance(tokenizer, BartTokenizer) and not line.startswith(" ") else {}
     tokenizer.padding_side = padding_side
@@ -212,7 +219,7 @@ def save_git_info(folder_path: str) -> None:
 
 def save_json(content, path, indent=4, **json_dump_kwargs):
     with open(path, "w") as f:
-        json.dump(content, f, indent=indent, **json_dump_kwargs)
+        json.dump(content, f, indent=indent, cls=NumpyEncoder)
 
 
 def load_json(path):

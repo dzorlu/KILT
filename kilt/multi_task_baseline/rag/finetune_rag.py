@@ -62,6 +62,7 @@ from utils_kilt_rag import (  # noqa: E402 # isort:skip
     save_json,
     set_extra_model_params,
     KILTDataset,
+    NumpyEncoder,
 )
 
 from torch.utils.data import Dataset
@@ -311,13 +312,13 @@ class KILTModule(BaseTransformer):
             epoch_metrics[m] = np.array(magg).mean()
         epoch_metrics['step_count'] = self.step_count
         # writes epoch metrics to self.metrics_save_path
-        self.save_metrics(epoch_metrics, prefix)
+        #self.save_metrics(epoch_metrics, prefix)
         #logger.info(f"epoch_metrics:{epoch_metrics}")
         self.log_dict(epoch_metrics)
 
-    def save_metrics(self, latest_metrics, type_path) -> None:
-        self.metrics[type_path].append(latest_metrics)
-        save_json(self.metrics, self.metrics_save_path)
+    # def save_metrics(self, latest_metrics, type_path) -> None:
+    #     self.metrics[type_path].append(latest_metrics)
+    #     save_json(self.metrics, self.metrics _save_path)
 
     def calc_generative_metrics(self, preds, target) -> Dict:
         if len(preds) != len(target):
@@ -444,7 +445,7 @@ class KILTModule(BaseTransformer):
             tokenizer=self.tokenizer,
             type_path=type_path,
             max_target_length=max_target_length,
-            n_obs=self.n_obs['train'],
+            n_obs=self.n_obs[type_path],
             **self.dataset_kwargs,
         )
         return dataset
