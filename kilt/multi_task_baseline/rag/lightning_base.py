@@ -277,6 +277,7 @@ class LoggingCallback(pl.Callback):
         # commented this out bc somehow it interferes w/ logging the loss function
         # by app increasing the step in wandb module.
         #pl_module.logger.log_metrics(lrs,)
+        #pl_module.logger.log_metrics(lrs, step=trainer.global_step)
 
     def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         rank_zero_info("***** Validation results *****")
@@ -381,7 +382,7 @@ def generic_train(
     train_params["accumulate_grad_batches"] = args.accumulate_grad_batches
     train_params["accelerator"] = extra_train_kwargs.get("accelerator", None)
     train_params["profiler"] = extra_train_kwargs.get("profiler", None)
-    train_params['num_sanity_val_steps'] = 100 #disable eval sanity check.
+    train_params['num_sanity_val_steps'] = 100 #args.num_sanity_val_steps #disable eval sanity check.
 
     trainer = pl.Trainer.from_argparse_args(
         args,

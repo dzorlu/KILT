@@ -6,6 +6,7 @@ import pickle
 import re
 import socket
 import string
+from copy import deepcopy
 from rouge import Rouge
 from collections import Counter
 from logging import getLogger
@@ -21,6 +22,19 @@ from datasets import load_from_disk
 import numpy as np
 
 from transformers import BartTokenizer, RagTokenizer, T5Tokenizer
+
+TASK_MAP = {'wow': 0,
+             'eli5': 1,
+             'fever': 2,
+             'aidayago2': 3,
+             'wned': 4,
+             'cweb': 5,
+             'trex': 6,
+             'structured_zeroshot': 7,
+             'nq': 8,
+             'hotpotqa': 9,
+             'triviaqa_support_only': 10
+        }
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -70,18 +84,7 @@ class KILTDataset(torch.utils.data.Dataset):
         nb_max_wiki_per_answer: int=5,
         prefix=""):
         
-        self.task_map = {'wow': 0,
-             'eli5': 1,
-             'fever': 2,
-             'aidayago2': 3,
-             'wned': 4,
-             'cweb': 5,
-             'trex': 6,
-             'structured_zeroshot': 7,
-             'nq': 8,
-             'hotpotqa': 9,
-             'triviaqa_support_only': 10
-        }
+        self.task_map = TASK_MAP
         if type_path == 'val': type_path = 'validation'
         self.type_path = type_path
 
@@ -108,6 +111,7 @@ class KILTDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return self.src_lens
+
 
     def _map(self, documents: dict, truncation=True, return_tensors='np', padding='max_length') -> dict:
         """Tokenize inputs and labels"""
@@ -219,7 +223,7 @@ def save_git_info(folder_path: str) -> None:
 
 def save_json(content, path, indent=4, **json_dump_kwargs):
     with open(path, "w") as f:
-        json.dump(content, f, indent=indent, cls=NumpyEncoder)
+        json.dump(content, f, indent=indent)
 
 
 def load_json(path):
@@ -243,8 +247,9 @@ def lmap(f: Callable, x: Iterable) -> List:
     return list(map(f, x))
 
 
-def lmap_inv(x: Iterable, y: Iterable) -> List[List]:
+def lmap_inv(x: Iterable, target: Iterable) -> List[List]:
     """turn y into x-like"""
+    y = deepcopy(target)
     x_like = list()
     _size = len(y) // len(x)
     while y:
@@ -337,7 +342,7 @@ def _computeRprec(guess_ids, gold_ids):
 
 
 # R-precision https://link.springer.com/referenceworkentry/10.1007%2F978-0-387-39940-9_486
-def calculate_rprecision(guess_items: np.ndarray, gold_items: np.ndarray) -> List:
+def calculate_rprecision(guess_items: List, gold_items: np.ndarray) -> List:
     Rprec_vector_batch = []
     for prs, gts in zip(guess_items, gold_items):
         Rprec_vector = []

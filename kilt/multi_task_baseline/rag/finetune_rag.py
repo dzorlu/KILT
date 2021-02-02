@@ -46,6 +46,7 @@ from callbacks_rag import (  # noqa: E402 # isort:skipq
 
 from distributed_pytorch_retriever import RagPyTorchDistributedRetriever  # noqa: E402 # isort:skip
 from utils_kilt_rag import (  # noqa: E402 # isort:skip
+    TASK_MAP,
     calculate_rprecision,
     exact_match_score,
     metric_max_over_ground_truths,
@@ -139,6 +140,8 @@ class KILTModule(BaseTransformer):
         config_class = RagConfig if self.is_rag_model else AutoConfig
         config = config_class.from_pretrained(hparams.model_name_or_path)
 
+        self.inv_task_map = {v:k for k,v in TASK_MAP.items()}
+
         # set retriever parameters
         config.index_name = hparams.index_name or config.index_name
         config.passages_path = hparams.passages_path or config.passages_path
@@ -178,11 +181,12 @@ class KILTModule(BaseTransformer):
 
         save_git_info(self.hparams.output_dir)
         self.output_dir = Path(self.hparams.output_dir)
-        self.metrics_save_path = Path(self.output_dir) / "metrics.json"
+        self.predictions_save_path = self.output_dir
         self.hparams_save_path = Path(self.output_dir) / "hparams.pkl"
         pickle_save(self.hparams, self.hparams_save_path)
         self.step_count = 0
         self.metrics = defaultdict(list)
+        self.prediction_keys = ['retrieval', 'e2e']
 
         self.dataset_kwargs: dict = dict(
             data_dir=self.hparams.data_dir,
@@ -226,11 +230,16 @@ class KILTModule(BaseTransformer):
             generated_ids = generated_ids.reshape(-1, generated_ids.shape[-1])
         return generated_ids
             
-    def ids_to_clean_text(self, generated_ids: List[int]):
+    def ids_to_clean_text(self, generated_ids: List[int], tokenizer_type='decoder'):
         generated_ids = self.maybe_reshape(generated_ids)
-        gen_text = self.tokenizer.batch_decode(
-            generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
-        )
+        if tokenizer_type == 'decoder':
+            gen_text = self.tokenizer.batch_decode(
+                generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )
+        else:
+            gen_text = self.tokenizer.question_encoder.batch_decode(
+                generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )
         return lmap(str.strip, gen_text)
 
     def _step(self, batch: dict, prefix: str) -> float:
@@ -303,26 +312,32 @@ class KILTModule(BaseTransformer):
         metrics = [list(b.keys()) for b in outputs]
         metrics = set(chain.from_iterable(metrics))
         epoch_metrics = dict()
+        epoch_predictions = defaultdict(list)
         for m in metrics:
             magg = list()
             for o in outputs:
                 # a step might not have all metric combinations.
                 if m in o:
-                    magg.extend(o[m])
+                    if m not in 'preds':
+                        magg.extend(o[m])
+                    else:
+                        epoch_predictions[m].extend(o[m])
+
             epoch_metrics[m] = np.array(magg).mean()
         epoch_metrics['step_count'] = self.step_count
         # writes epoch metrics to self.metrics_save_path
-        #self.save_metrics(epoch_metrics, prefix)
+        self.save_predictions(epoch_predictions, prefix)
         #logger.info(f"epoch_metrics:{epoch_metrics}")
         self.log_dict(epoch_metrics)
 
-    # def save_metrics(self, latest_metrics, type_path) -> None:
-    #     self.metrics[type_path].append(latest_metrics)
-    #     save_json(self.metrics, self.metrics _save_path)
+    def save_predictions(self, epoch_predictions, prefix) -> None:
+        #logger.info(f"epoch predictions: {epoch_predictions}")
+        _file_path = os.path.join(self.predictions_save_path, f"predictions_epoch_{self.step_count}_{prefix}.json")
+        save_json(epoch_predictions, _file_path)
 
     def calc_generative_metrics(self, preds, target) -> Dict:
-        if len(preds) != len(target):
-            target = lmap_inv(preds, target)
+
+        #logger.info(f"calc_generative_metric: {target}")
         batch_em, batch_f1, batch_acc, batch_rougel = [], [], [], []
         for pr, gt in zip(preds, target): #List[str], List[List[str]]
             #total += 1
@@ -353,6 +368,8 @@ class KILTModule(BaseTransformer):
 
     def calculate_downstream_metrics(self, batch: dict) -> Dict:
         # downstream
+        # compute gen metrics
+        # pass targets and preds 
         generated_ids = self.model.generate(
             batch["input_ids"],
             attention_mask=batch["attention_masks"],
@@ -362,14 +379,23 @@ class KILTModule(BaseTransformer):
             max_length=self.target_lens["val"],
         )
         preds: List[str] = self.ids_to_clean_text(generated_ids) #[B]
-
         target: List[str] = self.ids_to_clean_text(batch["decoder_input_ids"]) #[BxA]
+        
+        questions: List[str] = self.ids_to_clean_text(
+            batch["input_ids"], 
+            tokenizer_type='question'
+        ) #[BxA]
+        #logger.info(f"calculate_downstream_metrics.targets: {target}")
+        if len(preds) != len(target):
+            target = lmap_inv(preds, target)
         gen_metrics: Dict = self.calc_generative_metrics(preds, target)
-        return gen_metrics
+        #logger.info(f"calculate_downstream_metrics2.targets: {target}")
+        return gen_metrics, {'target': target, 'preds': preds, 'questions': questions}
 
 
     def calculate_retrieval_metrics(self, batch: dict, n_docs: int=5) -> Dict:
-        # retrieval
+        # retrieval metrics
+        # retrieval doc_ids and ground-truth
         question_enc_outputs = self.model.rag.question_encoder(
             batch["input_ids"], 
             attention_mask=batch["attention_masks"]
@@ -378,16 +404,23 @@ class KILTModule(BaseTransformer):
         question_enc_pool_output = question_enc_outputs[0].detach().cpu().numpy()
         #question_enc_pool_output = question_enc_outputs[0]
 
-        doc_ids = self.model.rag.retriever(
+        batch_doc_ids = self.model.rag.retriever(
             batch["input_ids"],
             question_enc_pool_output,
             prefix=self.model.rag.generator.config.prefix,
             n_docs=n_docs, #TODO: INHERIT
             return_tensors="pt",
-        )['doc_ids'] #[B, n_docs]
+        )['doc_ids'].detach().cpu().numpy() #[B, n_docs]
+        # map from doc_id to wiki_id
+        wikipedia_ids = list()
+        for doc_ids in batch_doc_ids:
+            #logger.info(f"doc_ids: {doc_ids}")
+            _ids = [int(_id) for _id in self.model.rag.retriever.index.dataset[doc_ids]['wikipedia_id']]
+            wikipedia_ids.append(_ids)
+        #logger.info(f"wikipedia_ids: {wikipedia_ids}")
         gt = batch['wiki_ids'].detach().cpu().numpy() # [B, A, P]
-        batch_rprecision = calculate_rprecision(doc_ids, gt)
-        return {'rprecision': batch_rprecision}
+        batch_rprecision = calculate_rprecision(wikipedia_ids, gt)
+        return {'rprecision': batch_rprecision}, {'preds_docs_ids': wikipedia_ids, "target_doc_ids": gt.tolist()}
 
 
     def aggregate_metrics_by_task(self, task_names: np.ndarray, metrics: dict) -> Dict:
@@ -398,9 +431,26 @@ class KILTModule(BaseTransformer):
         metrics_agg = defaultdict(list)
         for m_name, vals in metrics.items():  
             for val, tid in zip(vals, task_names):
-                _name = '_'.join([prefix, m_name, str(tid)])
+                _name = '_'.join([prefix, m_name, self.inv_task_map[tid]])
                 metrics_agg[_name].append(val)
         return metrics_agg
+    
+    def aggregate_batch_logging(self, batch_retrieval_data, batch_e2e_data):
+        # aggregate prediction documents.
+        batch_retrieval_data.update(batch_e2e_data)
+        # ensure values are of same size
+        lens_ = [len(a) for a in batch_retrieval_data.values()]
+        assert len(set(lens_))==1, f"{lens_}"
+        # batch logging output
+        # {
+        #   'target': target, 
+        #   'preds': , 
+        #   'questions': ,
+        #   'preds_docs_ids:,
+        #   'target_doc_ids:,
+        # }
+        batch_data = [dict(zip(batch_retrieval_data,t)) for t in zip(*batch_retrieval_data.values())]
+        return batch_data
 
     def _generative_step(self, batch: dict, prefix: str, n_docs: int=5) -> Dict:
         """
@@ -409,8 +459,11 @@ class KILTModule(BaseTransformer):
         start_time = time.time()
         # DO I NEED THIS?
         #batch = BatchEncoding(batch)
-        batch_rprecision = self.calculate_retrieval_metrics(batch)
-        batch_metrics = self.calculate_downstream_metrics(batch)
+        batch_rprecision, batch_retrieval_data = self.calculate_retrieval_metrics(batch)
+        batch_metrics, batch_e2e_data = self.calculate_downstream_metrics(batch)
+        batch_logging_data = self.aggregate_batch_logging(batch_retrieval_data, batch_e2e_data)
+
+
         gen_time = (time.time() - start_time) / batch["input_ids"].shape[0]
         assert len(list(batch_rprecision.values())[0]) == len(list(batch_metrics.values())[0])
         batch_metrics.update(batch_rprecision)
@@ -425,16 +478,14 @@ class KILTModule(BaseTransformer):
             .narrow(dim=1,start=0,length=1) \
             .squeeze(dim=1)
         loss_dict = {f'{prefix}_loss': [self._step(batch, prefix).detach().cpu().numpy()]}
-        # base_metrics = {name: loss for name, loss in zip(self.loss_names, [loss_tensors])}
-        # base_metrics.update({'gen_time': gen_time})
         
         # reduce for each step w/o task aggregation
-        #batch_metrics = {f"{prefix}_{k}": np.array(v).mean() for k,v in batch_metrics.items()}
         batch_metrics = {f"{prefix}_{k}": v for k,v in batch_metrics.items()}
-        #logger.info(batch_metrics)
         batch_metrics.update(batch_metrics_by_task)
         batch_metrics.update(loss_dict)
-        #self.log_dict(batch_metrics, prog_bar=False)
+
+        # append with logging data.
+        batch_metrics.update({'preds': batch_logging_data})
         
         return batch_metrics # for epoch-end consumption {k: [v],..}
 
