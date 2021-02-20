@@ -398,7 +398,8 @@ class KILTModule(BaseTransformer):
         # retrieval doc_ids and ground-truth
         question_enc_outputs = self.model.rag.question_encoder(
             batch["input_ids"], 
-            attention_mask=batch["attention_masks"]
+            attention_mask=batch["attention_masks"],
+            return_dict=True
         )
         # faiss requires np.ndarray.
         question_enc_pool_output = question_enc_outputs[0].detach().cpu().numpy()
@@ -423,11 +424,10 @@ class KILTModule(BaseTransformer):
         return {'rprecision': batch_rprecision}, {'preds_docs_ids': wikipedia_ids, "target_doc_ids": gt.tolist()}
 
 
-    def aggregate_metrics_by_task(self, task_names: np.ndarray, metrics: dict) -> Dict:
+    def aggregate_metrics_by_task(self, task_names: np.ndarray, metrics: dict, prefix:str) -> Dict:
         """
         returns {'prefix_metric_task_id': [m1, m2, ...]}
         """
-        prefix = 'val'
         metrics_agg = defaultdict(list)
         for m_name, vals in metrics.items():  
             for val, tid in zip(vals, task_names):
@@ -461,15 +461,13 @@ class KILTModule(BaseTransformer):
         #batch = BatchEncoding(batch)
         batch_rprecision, batch_retrieval_data = self.calculate_retrieval_metrics(batch)
         batch_metrics, batch_e2e_data = self.calculate_downstream_metrics(batch)
-        batch_logging_data = self.aggregate_batch_logging(batch_retrieval_data, batch_e2e_data)
+        batch_logging_data = self.aggregate_batch_logging(batch_retrieval_data, batch_e2e_data, )
 
-
-        gen_time = (time.time() - start_time) / batch["input_ids"].shape[0]
         assert len(list(batch_rprecision.values())[0]) == len(list(batch_metrics.values())[0])
         batch_metrics.update(batch_rprecision)
 
         task_names = batch['task_names'].detach().cpu().numpy()
-        batch_metrics_by_task = self.aggregate_metrics_by_task(task_names, batch_metrics)
+        batch_metrics_by_task = self.aggregate_metrics_by_task(task_names, batch_metrics, prefix)
 
         # validation / test step data returns [B, A, D] for eval purposes
         # but for loss calculation take the first one. 
@@ -527,7 +525,8 @@ class KILTModule(BaseTransformer):
 
     @pl.utilities.rank_zero_only
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        save_path = self.output_dir.joinpath("checkpoint{}".format(self.step_count))
+        logger.info(f"checkpoint.keys: {checkpoint.keys()}")
+        save_path = self.output_dir.joinpath("checkpoint_{}".format(self.step_count))
         self.model.config.save_step = self.step_count
         self.model.save_pretrained(save_path)
         self.tokenizer.save_pretrained(save_path)

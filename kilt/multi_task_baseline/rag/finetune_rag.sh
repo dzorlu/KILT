@@ -15,19 +15,19 @@ export HF_HOME='/hdd/'
 #    --dropout 0.1 \
 #    --weight_decay 0.001 \
 #    --label_smoothing 0.1 \
+#    --fp16 \
 
 python finetune_rag.py \
     --data_dir '/hdd/kilt_tasks' \
-    --output_dir '/hdd/kilt_results' \
+    --output_dir '/hdd/kilt_results2' \
     --passages_path '/hdd/kilt' \
     --index_path '/hdd/kilt/index_v0.faiss' \
     --model_name_or_path '/hdd/kilt_pretrained_model' \
-    --model_type rag_sequence \
-    --fp16 \
+    --model_type rag_token \
     --gpus 1 \
     --do_train \
     --do_predict \
-    --n_train 200000 \
+    --n_train 40000 \
     --n_val 4000 \
     --train_batch_size 4 \
     --eval_batch_size 4 \
@@ -37,11 +37,11 @@ python finetune_rag.py \
     --test_max_target_length 25 \
     --adam_epsilon 1e-08 \
     --lr_scheduler linear \
-    --learning_rate 3e-05 \
+    --learning_rate 1e-05 \
     --num_train_epochs 5 \
     --warmup_steps 1000 \
-    --num_sanity_val_steps 100 \
-    --gradient_accumulation_steps 1 \
+    --num_sanity_val_steps 10 \
+    --gradient_accumulation_steps 2 \
     --index_name custom \
     --logger_name wandb \
     --check_val_every_n_epoch 1 \
